@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+spike/.venv/
+
+# Local captured spooler logs & unsanitized XML dumps (contain Windows username/hostname PII)
+spike/events.jsonl
+spike/raw_xml_samples/*.xml
+!spike/raw_xml_samples/event_805_rec_317_job_10.xml
+!spike/raw_xml_samples/event_307_rec_318_job_10.xml
+
+# Future Rust / Tauri v2 / SQLite / Node build & runtime artifacts
+target/
+src-tauri/target/
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local temporary logs, dumps & OS artifacts
+*.log
+*.tmp
+*.bak
+audit_dump.txt
+.DS_Store
+Thumbs.db
