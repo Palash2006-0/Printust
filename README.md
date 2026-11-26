@@ -83,11 +83,13 @@ See full per-case measurements in [docs/driver_lie_matrix.md](docs/driver_lie_ma
 ```text
 Printust/
 ├── docs/
-│   └── driver_lie_matrix.md      # 6-case empirical test table + findings
+│   ├── driver_lie_matrix.md      # 6-case empirical test table + findings
+│   └── spike_findings.md         # Day 3: Locked Duplex + Phase 3 Rust capture strategy
 ├── spike/
 │   ├── requirements.txt          # Pinned pywin32==312
 │   ├── setup_env.ps1             # Admin PowerShell helper (PrintService log + NUL port + printer)
 │   ├── spooler_spike.py          # Real-time Event ID 307 & 805 watcher + JobId correlator
+│   ├── shd_devmode_probe.py      # Day 3: Win32 JOB_INFO_2 (DEVMODE) + .SHD probe
 │   └── raw_xml_samples/          # Scrubbed Event 307 & 805 XML fixtures (local logs/PII gitignored)
 ├── .gitignore
 └── README.md
@@ -121,7 +123,7 @@ python -m venv spike\.venv
 ## 6. 21-Day Execution Roadmap (Nov 24 – Dec 14, 2026 | 42 Hours)
 
 - [ ] **Phase 1 — Days 1–2:** Virtual `NUL` printer (`ShopTest_PCL6`), PrintService operational logging, `spooler_spike.py` live watcher, scrubbed XML fixtures, Cases 1–5 verified in [Driver Lie Matrix](docs/driver_lie_matrix.md) *(Case 6 MS Word non-Chromium comparison pending)*
-- [ ] **Phase 1 — Day 3:** Paused queue `.SHD` shadow file (`DEVMODE` `dmCopies` / `dmDuplex` / `dmColor`) inspection & `spike_findings.md`
+- [x] **Phase 1 — Day 3:** Paused queue `JOB_INFO_2` (`DEVMODE` `dmCopies` / `dmDuplex` / `dmColor`) vs `.SHD` probe & locked [spike_findings.md](docs/spike_findings.md)
 - [ ] **Phase 2 (Days 4–6):** Surgical Rust bootcamp (`pricing.rs` paise math, `rusqlite` schema prototype, `mpsc` channels, minimal `windows-rs` FFI)
 - [ ] **Phase 3 (Days 7–11):** Tauri v2 scaffold, Rust Event Log watcher (`quick-xml`), Driver Lie Guard & deduplication, session state machine, WAL SQLite & Owner EOD audit engine
 - [ ] **Phase 4 (Days 12–15):** Non-focus-stealing always-on-top Mini-HUD (React/TS), global hotkeys, offline Dynamic UPI QR, Owner EOD dashboard & CSV export
