@@ -2,8 +2,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use printust_core::{
-    IncomingPrintJob, LedgerDb, LedgerError, PricingRules, SessionEngine, SessionStatus,
-    SessionSummary,
+    ColorMode, DuplexMode, IncomingPrintJob, IngestOutcome, LedgerDb, LedgerError, PricingRules,
+    SessionEngine, SessionStatus, SessionSummary,
 };
 
 fn make_job(
@@ -17,6 +17,7 @@ fn make_job(
 ) -> IncomingPrintJob {
     IncomingPrintJob {
         windows_job_id: job_id,
+        event_record_id: None,
         printer_name: "ShopTest_PCL6".to_owned(),
         doc_name: doc.to_owned(),
         raw_pages,
@@ -24,6 +25,8 @@ fn make_job(
         effective_pages: raw_pages.saturating_mul(raw_copies),
         is_duplex,
         is_color,
+        duplex_mode: DuplexMode::from_bool(is_duplex),
+        color_mode: ColorMode::from_bool(is_color),
         driver_anomaly_flag: None,
         captured_at: captured_at.to_owned(),
     }
@@ -442,4 +445,86 @@ fn daily_audit_range_queries_use_btree_indexes() {
         !sessions_plan.iter().any(|line| line.starts_with("SCAN ")),
         "unexpected full table scan on sessions: {sessions_plan:?}"
     );
+}
+
+#[test]
+fn idempotent_dedup_atomic_bookmark_and_unknown_duplex_fallback() {
+    let channel = "Microsoft-Windows-PrintService/Operational";
+    let db = LedgerDb::open_in_memory().unwrap();
+    assert!(db.load_bookmark(channel).unwrap().is_none());
+
+    let mut engine = SessionEngine::new(db);
+
+    // 1. DuplexMode::Unknown job with no explicit flag -> falls back to simplex + DEVMODE_RACE_MISSED
+    let mut job1 = make_job(
+        701,
+        "notes.pdf",
+        3,
+        1,
+        false,
+        false,
+        "2026-11-27T14:00:00Z",
+    );
+    job1.event_record_id = Some(9001);
+    job1.duplex_mode = DuplexMode::Unknown;
+    job1.color_mode = ColorMode::Monochrome;
+
+    let bookmark_v1 = "<BookmarkList><Bookmark Channel='Microsoft-Windows-PrintService/Operational' RecordId='9001'/></BookmarkList>";
+    let outcome1 = engine
+        .ingest_print_job_with_bookmark(job1.clone(), channel, bookmark_v1)
+        .unwrap();
+    match outcome1 {
+        IngestOutcome::Applied(summary) => {
+            assert_eq!(summary.total_amount_paise, 600); // 3 * 200 simplex fallback
+            assert!(summary.has_anomaly);
+        }
+        IngestOutcome::DuplicateIgnored => panic!("expected first job to be applied"),
+    }
+    assert_eq!(
+        engine.db().load_bookmark(channel).unwrap().as_deref(),
+        Some(bookmark_v1)
+    );
+    let stored_flag: Option<String> = engine
+        .db()
+        .connection()
+        .query_row(
+            "SELECT driver_anomaly_flag FROM print_jobs WHERE event_record_id = 9001",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_flag.as_deref(), Some("DEVMODE_RACE_MISSED"));
+
+    // 2. Close session and replay the same (printer_name, event_record_id) -> ignored cleanly,
+    //    must not reopen a phantom ACTIVE session or double-bill
+    engine
+        .close_active_session(SessionStatus::PaidUpi, "2026-11-27T14:01:00Z")
+        .unwrap();
+    let bookmark_v2 = "<BookmarkList><Bookmark Channel='Microsoft-Windows-PrintService/Operational' RecordId='9002'/></BookmarkList>";
+    let dup_outcome = engine
+        .ingest_print_job_with_bookmark(job1, channel, bookmark_v2)
+        .unwrap();
+    assert_eq!(dup_outcome, IngestOutcome::DuplicateIgnored);
+    assert!(engine.get_active_summary().unwrap().is_none());
+    // Bookmark advances cleanly even when skipping a duplicate event
+    assert_eq!(
+        engine.db().load_bookmark(channel).unwrap().as_deref(),
+        Some(bookmark_v2)
+    );
+
+    // 3. Invalid empty bookmark fails before writing job (atomic rollback safety)
+    let mut job2 = make_job(
+        702,
+        "next.pdf",
+        2,
+        1,
+        false,
+        false,
+        "2026-11-27T14:02:00Z",
+    );
+    job2.event_record_id = Some(9003);
+    assert!(engine
+        .ingest_print_job_with_bookmark(job2, channel, "   ")
+        .is_err());
+    assert!(engine.get_active_summary().unwrap().is_none());
 }

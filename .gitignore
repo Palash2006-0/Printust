@@ -17,9 +17,11 @@ spike/raw_xml_samples/*.xml
 
 # Future Rust / Tauri v2 / SQLite / Node build & runtime artifacts
 target/
+**/target/
 src-tauri/target/
 node_modules/
 dist/
+.agents/
 *.db
 *.db-wal
 *.db-shm

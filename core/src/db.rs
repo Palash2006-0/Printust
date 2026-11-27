@@ -16,7 +16,7 @@ const RULE_COLOR_DUPLEX_SHEET: &str = "COLOR_DUPLEX_SHEET";
 const RULE_BW_BULK_THRESHOLD: &str = "BW_BULK_THRESHOLD_SIDES";
 const RULE_BW_BULK_SIDE: &str = "BW_BULK_SIDE";
 
-const SCHEMA_SQL: &str = r#"
+const SCHEMA_TABLES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER REFERENCES sessions(id),
     windows_job_id INTEGER NOT NULL,
+    event_record_id INTEGER,
     printer_name TEXT NOT NULL,
     doc_name TEXT NOT NULL,
     raw_pages INTEGER NOT NULL,
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     effective_pages INTEGER NOT NULL,
     is_duplex INTEGER NOT NULL DEFAULT 0,
     is_color INTEGER NOT NULL DEFAULT 0,
+    duplex_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+    color_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     driver_anomaly_flag TEXT,
     captured_at TEXT NOT NULL
 );
@@ -54,11 +57,21 @@ CREATE TABLE IF NOT EXISTS pricing_rules (
     rate_paise INTEGER NOT NULL CHECK (rate_paise >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS watcher_bookmarks (
+    channel_name TEXT PRIMARY KEY,
+    bookmark_xml TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+const SCHEMA_INDEXES_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_single_active
 ON sessions(status) WHERE status = 'ACTIVE';
 CREATE INDEX IF NOT EXISTS idx_print_jobs_session_id ON print_jobs(session_id);
 CREATE INDEX IF NOT EXISTS idx_print_jobs_captured_at ON print_jobs(captured_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_print_jobs_printer_event_record
+ON print_jobs(printer_name, event_record_id) WHERE event_record_id IS NOT NULL;
 "#;
 
 /// SQLite-backed Printust ledger enforcing WAL durability, foreign keys, and atomic writes.
@@ -92,11 +105,43 @@ impl LedgerDb {
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(SCHEMA_TABLES_SQL)?;
+        Self::ensure_print_jobs_columns(&conn)?;
+        conn.execute_batch(SCHEMA_INDEXES_SQL)?;
 
         let db = Self { conn };
         db.seed_default_pricing_rules()?;
         Ok(db)
+    }
+
+    fn ensure_print_jobs_columns(conn: &Connection) -> Result<(), LedgerError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(print_jobs)")?;
+        let mut cols = std::collections::HashSet::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            cols.insert(name);
+        }
+
+        for (col_name, ddl) in [
+            (
+                "event_record_id",
+                "ALTER TABLE print_jobs ADD COLUMN event_record_id INTEGER",
+            ),
+            (
+                "duplex_mode",
+                "ALTER TABLE print_jobs ADD COLUMN duplex_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            ),
+            (
+                "color_mode",
+                "ALTER TABLE print_jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            ),
+        ] {
+            if !cols.contains(col_name) {
+                conn.execute(ddl, [])?;
+            }
+        }
+        Ok(())
     }
 
     fn seed_default_pricing_rules(&self) -> Result<(), LedgerError> {
@@ -238,6 +283,57 @@ impl LedgerDb {
         }
     }
 
+    /// Load the persisted Windows Event Log XML bookmark for `channel_name`, if present.
+    pub fn load_bookmark(&self, channel_name: &str) -> Result<Option<String>, LedgerError> {
+        if channel_name.trim().is_empty() {
+            return Err(LedgerError::InvalidInput(
+                "channel_name cannot be empty".to_owned(),
+            ));
+        }
+        let xml = self
+            .conn
+            .query_row(
+                "SELECT bookmark_xml FROM watcher_bookmarks WHERE channel_name = ?1",
+                params![channel_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(xml)
+    }
+
+    /// Helper to persist or advance a `watcher_bookmarks` checkpoint inside a connection or tx.
+    fn upsert_bookmark(
+        conn: &Connection,
+        channel_name: &str,
+        bookmark_xml: &str,
+        now_iso: &str,
+    ) -> Result<(), LedgerError> {
+        conn.execute(
+            "INSERT INTO watcher_bookmarks (channel_name, bookmark_xml, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_name) DO UPDATE SET
+                bookmark_xml = excluded.bookmark_xml,
+                updated_at = excluded.updated_at",
+            params![channel_name, bookmark_xml, now_iso],
+        )?;
+        Ok(())
+    }
+
+    /// Persist or update the Windows Event Log XML bookmark for `channel_name`.
+    pub fn save_bookmark(
+        &mut self,
+        channel_name: &str,
+        bookmark_xml: &str,
+        now_iso: &str,
+    ) -> Result<(), LedgerError> {
+        if channel_name.trim().is_empty() || bookmark_xml.trim().is_empty() {
+            return Err(LedgerError::InvalidInput(
+                "channel_name and bookmark_xml must be non-empty".to_owned(),
+            ));
+        }
+        Self::upsert_bookmark(&self.conn, channel_name, bookmark_xml, now_iso)
+    }
+
     /// Atomically append an immutable `print_jobs` audit row and add its cost to the session.
     pub fn append_print_job(
         &mut self,
@@ -253,23 +349,30 @@ impl LedgerDb {
         let tx = self.conn.transaction()?;
         Self::ensure_session_active(&tx, session_id)?;
 
+        let effective_duplex = job.resolved_is_duplex();
+        let effective_color = job.resolved_is_color();
+        let anomaly = job.resolved_anomaly_flag();
+
         tx.execute(
             "INSERT INTO print_jobs (
-                session_id, windows_job_id, printer_name, doc_name,
+                session_id, windows_job_id, event_record_id, printer_name, doc_name,
                 raw_pages, raw_copies, effective_pages, is_duplex, is_color,
-                driver_anomaly_flag, captured_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                duplex_mode, color_mode, driver_anomaly_flag, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session_id,
                 i64::from(job.windows_job_id),
+                job.event_record_id,
                 job.printer_name,
                 job.doc_name,
                 i64::from(job.raw_pages),
                 i64::from(job.raw_copies),
                 i64::from(job.effective_pages),
-                i64::from(job.is_duplex),
-                i64::from(job.is_color),
-                job.driver_anomaly_flag,
+                i64::from(effective_duplex),
+                i64::from(effective_color),
+                job.duplex_mode.as_str(),
+                job.color_mode.as_str(),
+                anomaly,
                 job.captured_at,
             ],
         )?;
@@ -284,6 +387,127 @@ impl LedgerDb {
 
         tx.commit()?;
         Ok(inserted_id)
+    }
+
+    /// Atomically deduplicate `(printer_name, event_record_id)`, auto-open an `ACTIVE` session if
+    /// needed, append `print_jobs`, increment `sessions.total_amount_paise`, and optionally update
+    /// `watcher_bookmarks` inside **one SQLite transaction**.
+    ///
+    /// Returns `Ok(Some((session_id, inserted_job_id)))` when newly inserted, or `Ok(None)` when a
+    /// duplicate event is safely ignored.
+    pub fn ingest_job_and_bookmark_atomic(
+        &mut self,
+        job: &IncomingPrintJob,
+        job_cost_paise: i64,
+        bookmark: Option<(&str, &str)>,
+    ) -> Result<Option<(i64, i64)>, LedgerError> {
+        if job_cost_paise < 0 {
+            return Err(LedgerError::InvalidInput(format!(
+                "job_cost_paise cannot be negative (got {job_cost_paise})"
+            )));
+        }
+        if let Some((channel, xml)) = bookmark {
+            if channel.trim().is_empty() || xml.trim().is_empty() {
+                return Err(LedgerError::InvalidInput(
+                    "bookmark channel_name and bookmark_xml must be non-empty".to_owned(),
+                ));
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+
+        if let Some(record_id) = job.event_record_id {
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM print_jobs
+                     WHERE printer_name = ?1 AND event_record_id = ?2
+                     LIMIT 1",
+                    params![job.printer_name, record_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if exists.is_some() {
+                if let Some((channel, xml)) = bookmark {
+                    Self::upsert_bookmark(&tx, channel, xml, &job.captured_at)?;
+                }
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
+
+        let session_id: i64 = match tx
+            .query_row(
+                "SELECT id FROM sessions WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO sessions (started_at, status, total_amount_paise, jam_deducted_pages)
+                     VALUES (?1, 'ACTIVE', 0, 0)",
+                    params![job.captured_at],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+
+        let effective_duplex = job.resolved_is_duplex();
+        let effective_color = job.resolved_is_color();
+        let anomaly = job.resolved_anomaly_flag();
+
+        let rows_affected = tx.execute(
+            "INSERT INTO print_jobs (
+                session_id, windows_job_id, event_record_id, printer_name, doc_name,
+                raw_pages, raw_copies, effective_pages, is_duplex, is_color,
+                duplex_mode, color_mode, driver_anomaly_flag, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(printer_name, event_record_id)
+             WHERE event_record_id IS NOT NULL DO NOTHING",
+            params![
+                session_id,
+                i64::from(job.windows_job_id),
+                job.event_record_id,
+                job.printer_name,
+                job.doc_name,
+                i64::from(job.raw_pages),
+                i64::from(job.raw_copies),
+                i64::from(job.effective_pages),
+                i64::from(effective_duplex),
+                i64::from(effective_color),
+                job.duplex_mode.as_str(),
+                job.color_mode.as_str(),
+                anomaly,
+                job.captured_at,
+            ],
+        )?;
+
+        if rows_affected == 0 {
+            if let Some((channel, xml)) = bookmark {
+                Self::upsert_bookmark(&tx, channel, xml, &job.captured_at)?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let inserted_id = tx.last_insert_rowid();
+
+        tx.execute(
+            "UPDATE sessions
+             SET total_amount_paise = total_amount_paise + ?1
+             WHERE id = ?2",
+            params![job_cost_paise, session_id],
+        )?;
+
+        if let Some((channel, xml)) = bookmark {
+            Self::upsert_bookmark(&tx, channel, xml, &job.captured_at)?;
+        }
+
+        tx.commit()?;
+        Ok(Some((session_id, inserted_id)))
     }
 
     /// Atomically record a non-print add-on (e.g., Spiral Binding, Lamination) on an active session.

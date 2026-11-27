@@ -109,11 +109,129 @@ impl PricingRules {
     }
 }
 
+/// Duplex printing mode extracted from Win32 `DEVMODEW.dmDuplex`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DuplexMode {
+    Simplex,
+    DuplexLongEdge,
+    DuplexShortEdge,
+    #[default]
+    Unknown,
+}
+
+impl DuplexMode {
+    /// Canonical uppercase representation persisted in SQLite `print_jobs.duplex_mode`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Simplex => "SIMPLEX",
+            Self::DuplexLongEdge => "DUPLEX_LONG_EDGE",
+            Self::DuplexShortEdge => "DUPLEX_SHORT_EDGE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// True only when 2-sided printing was affirmatively detected; `Unknown` falls back to simplex.
+    pub fn is_duplex_billable(&self) -> bool {
+        matches!(self, Self::DuplexLongEdge | Self::DuplexShortEdge)
+    }
+
+    /// Convert a known boolean flag into an explicit `DuplexMode`.
+    pub fn from_bool(is_duplex: bool) -> Self {
+        if is_duplex {
+            Self::DuplexLongEdge
+        } else {
+            Self::Simplex
+        }
+    }
+}
+
+impl fmt::Display for DuplexMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DuplexMode {
+    type Err = LedgerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SIMPLEX" => Ok(Self::Simplex),
+            "DUPLEX_LONG_EDGE" => Ok(Self::DuplexLongEdge),
+            "DUPLEX_SHORT_EDGE" => Ok(Self::DuplexShortEdge),
+            "UNKNOWN" => Ok(Self::Unknown),
+            other => Err(LedgerError::InvalidInput(format!(
+                "invalid duplex_mode: {other}"
+            ))),
+        }
+    }
+}
+
+/// Color mode extracted from Event `805` (`RenderJobDiag/Color`) or `DEVMODEW.dmColor`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ColorMode {
+    Monochrome,
+    Color,
+    #[default]
+    Unknown,
+}
+
+impl ColorMode {
+    /// Canonical uppercase representation persisted in SQLite `print_jobs.color_mode`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Monochrome => "MONOCHROME",
+            Self::Color => "COLOR",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// True when color was detected; `Unknown` defaults safely to monochrome.
+    pub fn is_color_billable(&self) -> bool {
+        matches!(self, Self::Color)
+    }
+
+    /// Convert a known boolean flag into an explicit `ColorMode`.
+    pub fn from_bool(is_color: bool) -> Self {
+        if is_color {
+            Self::Color
+        } else {
+            Self::Monochrome
+        }
+    }
+}
+
+impl fmt::Display for ColorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ColorMode {
+    type Err = LedgerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "MONOCHROME" => Ok(Self::Monochrome),
+            "COLOR" => Ok(Self::Color),
+            "UNKNOWN" => Ok(Self::Unknown),
+            other => Err(LedgerError::InvalidInput(format!(
+                "invalid color_mode: {other}"
+            ))),
+        }
+    }
+}
+
 /// Normalized print-job payload emitted by the Windows spooler + Event Log watcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingPrintJob {
     /// Windows spooler job identifier (`JOB_INFO_2.JobId` / Event 307 `Param1`).
     pub windows_job_id: u32,
+    /// Optional Event Log `EventRecordID` from Event `307` for idempotent deduplication.
+    #[serde(default)]
+    pub event_record_id: Option<i64>,
     /// Target Windows printer queue name (e.g., `ShopTest_PCL6`).
     pub printer_name: String,
     /// Document title (`JOB_INFO_2.pDocument` when captured, else Event 307 `Param2`).
@@ -124,14 +242,71 @@ pub struct IncomingPrintJob {
     pub raw_copies: u32,
     /// Normalized effective side/sheet count after driver-lie heuristics.
     pub effective_pages: u32,
-    /// Whether the job used 2-sided printing (`false` when simplex or unknown fallback).
+    /// Whether the job used 2-sided printing (`false` when simplex or `DuplexMode::Unknown`).
     pub is_duplex: bool,
     /// Whether the job was rendered in color (`dmColor == 2` / Event 805 `Color == 2`).
     pub is_color: bool,
-    /// Optional anomaly marker (e.g., `"DUPLEX_UNKNOWN"` when `GetJobW` missed a sub-50ms job).
+    /// Explicit tri-state/four-state duplex mode (`Unknown` falls back to simplex billing).
+    #[serde(default)]
+    pub duplex_mode: DuplexMode,
+    /// Explicit color classification (`Unknown` falls back safely to monochrome).
+    #[serde(default)]
+    pub color_mode: ColorMode,
+    /// Optional anomaly marker (e.g., `"DEVMODE_RACE_MISSED"` when `GetJobW` missed a sub-50ms job).
     pub driver_anomaly_flag: Option<String>,
     /// ISO-8601 UTC capture timestamp from Windows Event `TimeCreated/@SystemTime`.
     pub captured_at: String,
+}
+
+impl IncomingPrintJob {
+    /// Effective duplex flag for billing; `DuplexMode::Unknown` safely falls back to simplex.
+    pub fn resolved_is_duplex(&self) -> bool {
+        match self.duplex_mode {
+            DuplexMode::DuplexLongEdge | DuplexMode::DuplexShortEdge => true,
+            DuplexMode::Simplex | DuplexMode::Unknown => false,
+        }
+    }
+
+    /// Effective color flag for billing; honors explicit `ColorMode` or boolean fallback when `Unknown`.
+    pub fn resolved_is_color(&self) -> bool {
+        match self.color_mode {
+            ColorMode::Color => true,
+            ColorMode::Monochrome => false,
+            ColorMode::Unknown => self.is_color,
+        }
+    }
+
+    /// Preserve custom anomaly markers or default to `"DEVMODE_RACE_MISSED"` when duplex is `Unknown`.
+    pub fn resolved_anomaly_flag(&self) -> Option<String> {
+        match &self.driver_anomaly_flag {
+            Some(flag) if !flag.trim().is_empty() => Some(flag.clone()),
+            _ if self.duplex_mode == DuplexMode::Unknown => Some("DEVMODE_RACE_MISSED".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// Resolve `(pages_per_copy, copies)` safely without double-multiplying unrolled Event 307 counts.
+    pub fn resolved_pricing_inputs(&self) -> (u32, u32) {
+        let copies = self.raw_copies.max(1);
+        if self.raw_pages > 0 && self.raw_pages.saturating_mul(copies) == self.effective_pages {
+            (self.raw_pages, copies)
+        } else if self.resolved_is_duplex() && copies > 1 && self.effective_pages.is_multiple_of(copies)
+        {
+            (self.effective_pages / copies, copies)
+        } else {
+            (self.effective_pages, 1)
+        }
+    }
+}
+
+/// Result of an idempotent print-job ingestion attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "summary", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IngestOutcome {
+    /// Event was newly inserted, billed, and persisted (with optional bookmark advance).
+    Applied(SessionSummary),
+    /// Event `(printer_name, event_record_id)` was already processed and skipped cleanly.
+    DuplicateIgnored,
 }
 
 /// Non-print shop add-on attached to a billing session (e.g., Spiral Binding, Lamination).

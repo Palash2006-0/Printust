@@ -1,9 +1,10 @@
 use std::str::FromStr;
 
 use printust_core::models::{
-    IncomingPrintJob, LedgerError, PricingRules, SessionStatus, SessionSummary,
+    ColorMode, DuplexMode, IncomingPrintJob, LedgerError, PricingRules, SessionStatus,
+    SessionSummary,
 };
-use printust_core::pricing::calculate_job_cost_paise;
+use printust_core::pricing::{calculate_job_cost_for_modes, calculate_job_cost_paise};
 
 #[test]
 fn zero_pages_or_zero_copies_cost_is_zero() {
@@ -104,6 +105,7 @@ fn models_status_roundtrip_and_serde_json() {
 
     let job = IncomingPrintJob {
         windows_job_id: 11,
+        event_record_id: Some(318),
         printer_name: "ShopTest_PCL6".to_owned(),
         doc_name: "test_doc.pdf".to_owned(),
         raw_pages: 4,
@@ -111,12 +113,29 @@ fn models_status_roundtrip_and_serde_json() {
         effective_pages: 12,
         is_duplex: true,
         is_color: false,
+        duplex_mode: DuplexMode::DuplexLongEdge,
+        color_mode: ColorMode::Monochrome,
         driver_anomaly_flag: None,
         captured_at: "2026-11-26T14:00:00Z".to_owned(),
     };
     let json = serde_json::to_string(&job).unwrap();
     let decoded: IncomingPrintJob = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, job);
+
+    // Explicitly verify DuplexMode and ColorMode pricing & Unknown fallback policies
+    assert_eq!(
+        calculate_job_cost_for_modes(4, 1, ColorMode::Monochrome, DuplexMode::DuplexLongEdge, &PricingRules::default()),
+        600
+    );
+    assert_eq!(
+        calculate_job_cost_for_modes(4, 1, ColorMode::Monochrome, DuplexMode::DuplexShortEdge, &PricingRules::default()),
+        600
+    );
+    // DuplexMode::Unknown bills as simplex safely (4 * 200 = 800 paise)
+    assert_eq!(
+        calculate_job_cost_for_modes(4, 1, ColorMode::Unknown, DuplexMode::Unknown, &PricingRules::default()),
+        800
+    );
 
     let summary = SessionSummary {
         session_id: 1,

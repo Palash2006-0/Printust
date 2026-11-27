@@ -1,6 +1,6 @@
 //! Pure integer-paise print-shop slab pricing engine.
 
-use crate::models::PricingRules;
+use crate::models::{ColorMode, DuplexMode, PricingRules};
 
 /// Calculate the exact print job cost in integer `i64` paise (`Rs. 1 = 100 paise`).
 ///
@@ -57,4 +57,26 @@ pub fn calculate_job_cost_paise(
     } else {
         i64::from(total_sides).saturating_mul(single_rate)
     }
+}
+
+/// Calculate print job cost directly from explicit `ColorMode` and `DuplexMode` metadata.
+///
+/// Fallback policy for race conditions:
+/// - `DuplexMode::Unknown` (when a fast unpaused job exits `GetJobW` before `DEVMODEW` is read)
+///   safely bills at the simplex rate while `DEVMODE_RACE_MISSED` surfaces in the Mini-HUD.
+/// - `ColorMode::Unknown` safely bills at the monochrome rate rather than guessing color.
+pub fn calculate_job_cost_for_modes(
+    pages_per_copy: u32,
+    copies: u32,
+    color_mode: ColorMode,
+    duplex_mode: DuplexMode,
+    rules: &PricingRules,
+) -> i64 {
+    calculate_job_cost_paise(
+        pages_per_copy,
+        copies,
+        color_mode.is_color_billable(),
+        duplex_mode.is_duplex_billable(),
+        rules,
+    )
 }

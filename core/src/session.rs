@@ -2,27 +2,9 @@
 
 use crate::db::LedgerDb;
 use crate::models::{
-    DailyAuditReport, IncomingPrintJob, LedgerError, SessionStatus, SessionSummary,
+    DailyAuditReport, IncomingPrintJob, IngestOutcome, LedgerError, SessionStatus, SessionSummary,
 };
 use crate::pricing::calculate_job_cost_paise;
-
-/// Resolve `(pages_per_copy, copies)` safely from an `IncomingPrintJob` without double-multiplying.
-///
-/// - When `GetJobW` captured per-copy pages (`raw_pages * raw_copies == effective_pages`),
-///   returns `(raw_pages, raw_copies)` so multi-copy odd-duplex computes sheets per copy.
-/// - When `GetJobW` missed a fast job and only unrolled Event `307` `PagesPrinted` was available
-///   (so `effective_pages` already equals total impressions), returns `(effective_pages, 1)`
-///   to prevent double-multiplying by `raw_copies`.
-fn resolve_pricing_inputs(job: &IncomingPrintJob) -> (u32, u32) {
-    let copies = job.raw_copies.max(1);
-    if job.raw_pages > 0 && job.raw_pages.saturating_mul(copies) == job.effective_pages {
-        (job.raw_pages, copies)
-    } else if job.is_duplex && copies > 1 && job.effective_pages.is_multiple_of(copies) {
-        (job.effective_pages / copies, copies)
-    } else {
-        (job.effective_pages, 1)
-    }
-}
 
 /// High-level state machine managing the active customer billing session in SQLite.
 pub struct SessionEngine {
@@ -45,21 +27,65 @@ impl SessionEngine {
         &mut self.db
     }
 
+    fn compute_job_cost(&self, job: &IncomingPrintJob) -> Result<i64, LedgerError> {
+        let rules = self.db.load_pricing_rules()?;
+        let (pages_per_copy, copies) = job.resolved_pricing_inputs();
+        Ok(calculate_job_cost_paise(
+            pages_per_copy,
+            copies,
+            job.resolved_is_color(),
+            job.resolved_is_duplex(),
+            &rules,
+        ))
+    }
+
     /// Ingest a captured print job: auto-open an `ACTIVE` session if needed, compute cost
     /// in integer paise, persist atomically, and return the refreshed `SessionSummary`.
     pub fn ingest_print_job(&mut self, job: IncomingPrintJob) -> Result<SessionSummary, LedgerError> {
         let session_id = self.db.get_or_create_active_session(&job.captured_at)?;
-        let rules = self.db.load_pricing_rules()?;
-        let (pages_per_copy, copies) = resolve_pricing_inputs(&job);
-        let job_cost_paise = calculate_job_cost_paise(
-            pages_per_copy,
-            copies,
-            job.is_color,
-            job.is_duplex,
-            &rules,
-        );
+        let job_cost_paise = self.compute_job_cost(&job)?;
         self.db.append_print_job(session_id, &job, job_cost_paise)?;
         self.db.get_session_summary(session_id)
+    }
+
+    /// Idempotently ingest a print job without a bookmark update.
+    pub fn ingest_print_job_idempotent(
+        &mut self,
+        job: IncomingPrintJob,
+    ) -> Result<IngestOutcome, LedgerError> {
+        let job_cost_paise = self.compute_job_cost(&job)?;
+        match self
+            .db
+            .ingest_job_and_bookmark_atomic(&job, job_cost_paise, None)?
+        {
+            Some((session_id, _)) => {
+                let summary = self.db.get_session_summary(session_id)?;
+                Ok(IngestOutcome::Applied(summary))
+            }
+            None => Ok(IngestOutcome::DuplicateIgnored),
+        }
+    }
+
+    /// Idempotently ingest a print job and persist its updated Windows Event Log XML bookmark
+    /// inside a **single atomic SQLite transaction**.
+    pub fn ingest_print_job_with_bookmark(
+        &mut self,
+        job: IncomingPrintJob,
+        channel_name: &str,
+        bookmark_xml: &str,
+    ) -> Result<IngestOutcome, LedgerError> {
+        let job_cost_paise = self.compute_job_cost(&job)?;
+        match self.db.ingest_job_and_bookmark_atomic(
+            &job,
+            job_cost_paise,
+            Some((channel_name, bookmark_xml)),
+        )? {
+            Some((session_id, _)) => {
+                let summary = self.db.get_session_summary(session_id)?;
+                Ok(IngestOutcome::Applied(summary))
+            }
+            None => Ok(IngestOutcome::DuplicateIgnored),
+        }
     }
 
     /// Deduct 1 jammed/misprinted page (`rules.bw_single_paise`) from the active session.
