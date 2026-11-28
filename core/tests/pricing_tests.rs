@@ -146,9 +146,16 @@ fn models_status_roundtrip_and_serde_json() {
         bw_pages: 12,
         color_pages: 0,
         jam_deducted_pages: 0,
+        bw_jam_deducted_pages: 0,
+        color_jam_deducted_pages: 0,
+        bw_jam_rate_paise: 200,
+        color_jam_rate_paise: 1000,
         addons_total_paise: 0,
         total_amount_paise: 1800,
         has_anomaly: false,
+        unverified_jobs_count: 0,
+        anomaly_reasons: vec![],
+        jobs: vec![],
         last_doc_name: Some("test_doc.pdf".to_owned()),
     };
     let summary_json = serde_json::to_string(&summary).unwrap();

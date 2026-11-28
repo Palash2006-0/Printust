@@ -10,8 +10,8 @@ pub mod session;
 
 pub use db::LedgerDb;
 pub use models::{
-    ColorMode, DailyAuditReport, DuplexMode, IncomingPrintJob, IngestOutcome, LedgerError,
-    PricingRules, SessionAddon, SessionStatus, SessionSummary,
+    ColorMode, DailyAuditReport, DuplexMode, IncomingPrintJob, IngestOutcome, JamInkKind,
+    LedgerError, PricingRules, SessionAddon, SessionJobBreakdown, SessionStatus, SessionSummary,
 };
 pub use pricing::{calculate_job_cost_for_modes, calculate_job_cost_paise};
 pub use session::SessionEngine;

@@ -2,7 +2,8 @@
 
 use crate::db::LedgerDb;
 use crate::models::{
-    DailyAuditReport, IncomingPrintJob, IngestOutcome, LedgerError, SessionStatus, SessionSummary,
+    DailyAuditReport, IncomingPrintJob, IngestOutcome, JamInkKind, LedgerError, SessionStatus,
+    SessionSummary,
 };
 use crate::pricing::calculate_job_cost_paise;
 
@@ -60,7 +61,7 @@ impl SessionEngine {
         {
             Some((session_id, _)) => {
                 let summary = self.db.get_session_summary(session_id)?;
-                Ok(IngestOutcome::Applied(summary))
+                Ok(IngestOutcome::Applied(Box::new(summary)))
             }
             None => Ok(IngestOutcome::DuplicateIgnored),
         }
@@ -82,19 +83,27 @@ impl SessionEngine {
         )? {
             Some((session_id, _)) => {
                 let summary = self.db.get_session_summary(session_id)?;
-                Ok(IngestOutcome::Applied(summary))
+                Ok(IngestOutcome::Applied(Box::new(summary)))
             }
             None => Ok(IngestOutcome::DuplicateIgnored),
         }
     }
 
-    /// Deduct 1 jammed/misprinted page (`rules.bw_single_paise`) from the active session.
-    pub fn apply_jam_deduction(&mut self) -> Result<Option<SessionSummary>, LedgerError> {
+    /// Deduct 1 jammed/misprinted page from the active session scoped explicitly by ink type
+    /// (`rules.bw_single_paise` for `Bw`, `rules.color_single_paise` for `Color`).
+    pub fn apply_jam_deduction(
+        &mut self,
+        kind: JamInkKind,
+    ) -> Result<Option<SessionSummary>, LedgerError> {
         let Some(session_id) = self.db.get_active_session_id()? else {
             return Ok(None);
         };
         let rules = self.db.load_pricing_rules()?;
-        self.db.deduct_jam_page(session_id, rules.bw_single_paise)?;
+        let deduct_paise = match kind {
+            JamInkKind::Bw => rules.bw_single_paise,
+            JamInkKind::Color => rules.color_single_paise,
+        };
+        self.db.deduct_jam_page(session_id, kind, deduct_paise)?;
         Ok(Some(self.db.get_session_summary(session_id)?))
     }
 

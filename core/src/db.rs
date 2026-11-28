@@ -6,8 +6,10 @@ use std::str::FromStr;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
-    DailyAuditReport, IncomingPrintJob, LedgerError, PricingRules, SessionStatus, SessionSummary,
+    resolve_pricing_inputs, ColorMode, DailyAuditReport, DuplexMode, IncomingPrintJob, JamInkKind,
+    LedgerError, PricingRules, SessionJobBreakdown, SessionStatus, SessionSummary,
 };
+use crate::pricing::calculate_job_cost_paise;
 
 const RULE_BW_SINGLE: &str = "BW_SINGLE";
 const RULE_BW_DUPLEX_SHEET: &str = "BW_DUPLEX_SHEET";
@@ -23,7 +25,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     closed_at TEXT,
     status TEXT NOT NULL CHECK(status IN ('ACTIVE','PAID_UPI','PAID_CASH','KHATA','VOID')),
     total_amount_paise INTEGER NOT NULL DEFAULT 0,
-    jam_deducted_pages INTEGER NOT NULL DEFAULT 0
+    jam_deducted_pages INTEGER NOT NULL DEFAULT 0,
+    bw_jam_deducted_pages INTEGER NOT NULL DEFAULT 0,
+    color_jam_deducted_pages INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS print_jobs (
@@ -40,6 +44,7 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     is_color INTEGER NOT NULL DEFAULT 0,
     duplex_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
     color_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+    cost_paise INTEGER,
     driver_anomaly_flag TEXT,
     captured_at TEXT NOT NULL
 );
@@ -106,6 +111,7 @@ impl LedgerDb {
              PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(SCHEMA_TABLES_SQL)?;
+        Self::ensure_sessions_columns(&conn)?;
         Self::ensure_print_jobs_columns(&conn)?;
         conn.execute_batch(SCHEMA_INDEXES_SQL)?;
 
@@ -114,8 +120,12 @@ impl LedgerDb {
         Ok(db)
     }
 
-    fn ensure_print_jobs_columns(conn: &Connection) -> Result<(), LedgerError> {
-        let mut stmt = conn.prepare("PRAGMA table_info(print_jobs)")?;
+    fn ensure_table_columns(
+        conn: &Connection,
+        table: &str,
+        expected: &[(&str, &str)],
+    ) -> Result<(), LedgerError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let mut cols = std::collections::HashSet::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -123,25 +133,54 @@ impl LedgerDb {
             cols.insert(name);
         }
 
-        for (col_name, ddl) in [
-            (
-                "event_record_id",
-                "ALTER TABLE print_jobs ADD COLUMN event_record_id INTEGER",
-            ),
-            (
-                "duplex_mode",
-                "ALTER TABLE print_jobs ADD COLUMN duplex_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
-            ),
-            (
-                "color_mode",
-                "ALTER TABLE print_jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
-            ),
-        ] {
-            if !cols.contains(col_name) {
+        for (col_name, ddl) in expected {
+            if !cols.contains(*col_name) {
                 conn.execute(ddl, [])?;
             }
         }
         Ok(())
+    }
+
+    fn ensure_sessions_columns(conn: &Connection) -> Result<(), LedgerError> {
+        Self::ensure_table_columns(
+            conn,
+            "sessions",
+            &[
+                (
+                    "bw_jam_deducted_pages",
+                    "ALTER TABLE sessions ADD COLUMN bw_jam_deducted_pages INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "color_jam_deducted_pages",
+                    "ALTER TABLE sessions ADD COLUMN color_jam_deducted_pages INTEGER NOT NULL DEFAULT 0",
+                ),
+            ],
+        )
+    }
+
+    fn ensure_print_jobs_columns(conn: &Connection) -> Result<(), LedgerError> {
+        Self::ensure_table_columns(
+            conn,
+            "print_jobs",
+            &[
+                (
+                    "event_record_id",
+                    "ALTER TABLE print_jobs ADD COLUMN event_record_id INTEGER",
+                ),
+                (
+                    "duplex_mode",
+                    "ALTER TABLE print_jobs ADD COLUMN duplex_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                ),
+                (
+                    "color_mode",
+                    "ALTER TABLE print_jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                ),
+                (
+                    "cost_paise",
+                    "ALTER TABLE print_jobs ADD COLUMN cost_paise INTEGER",
+                ),
+            ],
+        )
     }
 
     fn seed_default_pricing_rules(&self) -> Result<(), LedgerError> {
@@ -357,8 +396,8 @@ impl LedgerDb {
             "INSERT INTO print_jobs (
                 session_id, windows_job_id, event_record_id, printer_name, doc_name,
                 raw_pages, raw_copies, effective_pages, is_duplex, is_color,
-                duplex_mode, color_mode, driver_anomaly_flag, captured_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                duplex_mode, color_mode, cost_paise, driver_anomaly_flag, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session_id,
                 i64::from(job.windows_job_id),
@@ -372,6 +411,7 @@ impl LedgerDb {
                 i64::from(effective_color),
                 job.duplex_mode.as_str(),
                 job.color_mode.as_str(),
+                job_cost_paise,
                 anomaly,
                 job.captured_at,
             ],
@@ -463,8 +503,8 @@ impl LedgerDb {
             "INSERT INTO print_jobs (
                 session_id, windows_job_id, event_record_id, printer_name, doc_name,
                 raw_pages, raw_copies, effective_pages, is_duplex, is_color,
-                duplex_mode, color_mode, driver_anomaly_flag, captured_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                duplex_mode, color_mode, cost_paise, driver_anomaly_flag, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(printer_name, event_record_id)
              WHERE event_record_id IS NOT NULL DO NOTHING",
             params![
@@ -480,6 +520,7 @@ impl LedgerDb {
                 i64::from(effective_color),
                 job.duplex_mode.as_str(),
                 job.color_mode.as_str(),
+                job_cost_paise,
                 anomaly,
                 job.captured_at,
             ],
@@ -559,10 +600,12 @@ impl LedgerDb {
         Ok(inserted_id)
     }
 
-    /// Deduct 1 jammed/misprinted page from an active session, clamping `total_amount_paise >= 0`.
+    /// Deduct 1 jammed/misprinted B&W or Color page from an active session, clamping
+    /// `total_amount_paise >= 0` without mutating append-only `print_jobs` rows.
     pub fn deduct_jam_page(
         &mut self,
         session_id: i64,
+        kind: JamInkKind,
         unit_deduct_paise: i64,
     ) -> Result<(), LedgerError> {
         if unit_deduct_paise < 0 {
@@ -574,12 +617,37 @@ impl LedgerDb {
         let tx = self.conn.transaction()?;
         Self::ensure_session_active(&tx, session_id)?;
 
+        let target_is_color: i64 = match kind {
+            JamInkKind::Bw => 0,
+            JamInkKind::Color => 1,
+        };
+        let ink_pages: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(effective_pages), 0)
+             FROM print_jobs
+             WHERE session_id = ?1 AND (CASE WHEN is_color = 0 THEN 0 ELSE 1 END) = ?2",
+            params![session_id, target_is_color],
+            |row| row.get(0),
+        )?;
+        if ink_pages <= 0 {
+            return Err(LedgerError::InvalidInput(format!(
+                "cannot deduct {} jam when session {session_id} has 0 {} pages",
+                kind.as_str(),
+                kind.as_str()
+            )));
+        }
+
+        let (bw_inc, color_inc): (i64, i64) = match kind {
+            JamInkKind::Bw => (1, 0),
+            JamInkKind::Color => (0, 1),
+        };
         tx.execute(
             "UPDATE sessions
              SET jam_deducted_pages = jam_deducted_pages + 1,
-                 total_amount_paise = MAX(0, total_amount_paise - ?1)
-             WHERE id = ?2",
-            params![unit_deduct_paise, session_id],
+                 bw_jam_deducted_pages = bw_jam_deducted_pages + ?1,
+                 color_jam_deducted_pages = color_jam_deducted_pages + ?2,
+                 total_amount_paise = MAX(0, total_amount_paise - ?3)
+             WHERE id = ?4",
+            params![bw_inc, color_inc, unit_deduct_paise, session_id],
         )?;
 
         tx.commit()?;
@@ -611,51 +679,151 @@ impl LedgerDb {
         Ok(())
     }
 
-    /// Build a live `SessionSummary` snapshot for the floating Mini-HUD.
+    /// Build a live `SessionSummary` snapshot (including active job breakdown and anomaly counts)
+    /// for the floating Mini-HUD.
     pub fn get_session_summary(&self, session_id: i64) -> Result<SessionSummary, LedgerError> {
-        let session_row: Option<(String, Option<String>, String, i64, i64)> = self
+        struct SessionHeaderRow {
+            started_at: String,
+            closed_at: Option<String>,
+            status_str: String,
+            total_amount_paise: i64,
+            jam_deducted_pages: i64,
+            bw_jam_deducted_pages: i64,
+            color_jam_deducted_pages: i64,
+        }
+
+        let session_row = self
             .conn
             .query_row(
-                "SELECT started_at, closed_at, status, total_amount_paise, jam_deducted_pages
+                "SELECT started_at, closed_at, status, total_amount_paise, jam_deducted_pages,
+                        bw_jam_deducted_pages, color_jam_deducted_pages
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
+                    Ok(SessionHeaderRow {
+                        started_at: row.get(0)?,
+                        closed_at: row.get(1)?,
+                        status_str: row.get(2)?,
+                        total_amount_paise: row.get(3)?,
+                        jam_deducted_pages: row.get(4)?,
+                        bw_jam_deducted_pages: row.get(5)?,
+                        color_jam_deducted_pages: row.get(6)?,
+                    })
                 },
             )
-            .optional()?;
+            .optional()?
+            .ok_or(LedgerError::SessionNotFound(session_id))?;
 
-        let (started_at, closed_at, status_str, total_amount_paise, jam_deducted_pages) =
-            session_row.ok_or(LedgerError::SessionNotFound(session_id))?;
+        let SessionHeaderRow {
+            started_at,
+            closed_at,
+            status_str,
+            total_amount_paise,
+            jam_deducted_pages,
+            bw_jam_deducted_pages,
+            color_jam_deducted_pages,
+        } = session_row;
         let status = SessionStatus::from_str(&status_str)?;
+        let rules = self.load_pricing_rules()?;
 
-        let (job_count, bw_pages, color_pages, anomaly_int): (i64, i64, i64, i64) =
-            self.conn.query_row(
-                "SELECT
-                    COUNT(*),
-                    COALESCE(SUM(CASE WHEN is_color = 0 THEN effective_pages ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN is_color != 0 THEN effective_pages ELSE 0 END), 0),
-                    COALESCE(MAX(CASE WHEN driver_anomaly_flag IS NOT NULL AND TRIM(driver_anomaly_flag) != '' THEN 1 ELSE 0 END), 0)
-                 FROM print_jobs
-                 WHERE session_id = ?1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, doc_name, raw_pages, raw_copies, effective_pages, is_duplex, is_color,
+                    duplex_mode, color_mode, cost_paise, driver_anomaly_flag
+             FROM print_jobs
+             WHERE session_id = ?1
+             ORDER BY id DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
 
-        let last_doc_name: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT doc_name FROM print_jobs WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let mut job_count: i64 = 0;
+        let mut bw_pages: i64 = 0;
+        let mut color_pages: i64 = 0;
+        let mut unverified_jobs_count: i64 = 0;
+        let mut anomaly_reasons: Vec<String> = Vec::new();
+        let mut jobs: Vec<SessionJobBreakdown> = Vec::new();
+        let mut last_doc_name: Option<String> = None;
+
+        while let Some(row) = rows.next()? {
+            let job_id: i64 = row.get(0)?;
+            let doc_name: String = row.get(1)?;
+            let raw_pages_i64: i64 = row.get(2)?;
+            let raw_copies_i64: i64 = row.get(3)?;
+            let effective_pages_i64: i64 = row.get(4)?;
+            let is_duplex_int: i64 = row.get(5)?;
+            let is_color_int: i64 = row.get(6)?;
+            let duplex_str: String = row.get(7)?;
+            let color_str: String = row.get(8)?;
+            let stored_cost_paise: Option<i64> = row.get(9)?;
+            let driver_anomaly_flag: Option<String> = row.get(10)?;
+
+            if last_doc_name.is_none() {
+                last_doc_name = Some(doc_name.clone());
+            }
+
+            let is_duplex = is_duplex_int != 0;
+            let is_color = is_color_int != 0;
+            let duplex_mode = DuplexMode::from_str(&duplex_str)?;
+            let color_mode = ColorMode::from_str(&color_str)?;
+
+            let trimmed_anomaly = driver_anomaly_flag.and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_owned())
+                }
+            });
+
+            let is_unverified = duplex_mode == DuplexMode::Unknown
+                || color_mode == ColorMode::Unknown
+                || trimmed_anomaly.is_some();
+
+            job_count += 1;
+            if is_color {
+                color_pages += effective_pages_i64;
+            } else {
+                bw_pages += effective_pages_i64;
+            }
+            if is_unverified {
+                unverified_jobs_count += 1;
+            }
+
+            if let Some(ref reason) = trimmed_anomaly {
+                push_unique_reason(&mut anomaly_reasons, reason);
+            }
+            if duplex_mode == DuplexMode::Unknown && trimmed_anomaly.is_none() {
+                push_unique_reason(&mut anomaly_reasons, "DUPLEX_UNKNOWN");
+            }
+            if color_mode == ColorMode::Unknown {
+                push_unique_reason(&mut anomaly_reasons, "COLOR_UNKNOWN");
+            }
+
+            let cost_paise = match stored_cost_paise {
+                Some(cost) => cost,
+                None => {
+                    let raw_pages = u32::try_from(raw_pages_i64.max(0)).unwrap_or(u32::MAX);
+                    let raw_copies = u32::try_from(raw_copies_i64.max(1)).unwrap_or(u32::MAX);
+                    let effective_pages =
+                        u32::try_from(effective_pages_i64.max(0)).unwrap_or(u32::MAX);
+                    let (pages_per_copy, copies) =
+                        resolve_pricing_inputs(raw_pages, raw_copies, effective_pages, is_duplex);
+                    calculate_job_cost_paise(pages_per_copy, copies, is_color, is_duplex, &rules)
+                }
+            };
+
+            jobs.push(SessionJobBreakdown {
+                job_id,
+                doc_name,
+                effective_pages: effective_pages_i64,
+                duplex_mode,
+                color_mode,
+                is_duplex,
+                is_color,
+                cost_paise,
+                anomaly: trimmed_anomaly,
+                is_unverified,
+            });
+        }
 
         let addons_total_paise: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(qty * unit_price_paise), 0) FROM session_addons WHERE session_id = ?1",
@@ -672,9 +840,16 @@ impl LedgerDb {
             bw_pages,
             color_pages,
             jam_deducted_pages,
+            bw_jam_deducted_pages,
+            color_jam_deducted_pages,
+            bw_jam_rate_paise: rules.bw_single_paise,
+            color_jam_rate_paise: rules.color_single_paise,
             addons_total_paise,
             total_amount_paise,
-            has_anomaly: anomaly_int != 0,
+            has_anomaly: unverified_jobs_count > 0,
+            unverified_jobs_count,
+            anomaly_reasons,
+            jobs,
             last_doc_name,
         })
     }
@@ -758,5 +933,11 @@ impl LedgerDb {
             khata_total_paise,
             discrepancy_flag,
         })
+    }
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|existing| existing == reason) {
+        reasons.push(reason.to_owned());
     }
 }

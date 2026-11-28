@@ -2,8 +2,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use printust_core::{
-    ColorMode, DuplexMode, IncomingPrintJob, IngestOutcome, LedgerDb, LedgerError, PricingRules,
-    SessionEngine, SessionStatus, SessionSummary,
+    ColorMode, DuplexMode, IncomingPrintJob, IngestOutcome, JamInkKind, LedgerDb, LedgerError,
+    PricingRules, SessionEngine, SessionStatus, SessionSummary,
 };
 
 fn make_job(
@@ -113,7 +113,10 @@ fn jam_deduction_increments_count_and_clamps_total_at_zero() {
     let db = LedgerDb::open_in_memory().unwrap();
     let mut engine = SessionEngine::new(db);
 
-    assert!(engine.apply_jam_deduction().unwrap().is_none());
+    assert!(engine
+        .apply_jam_deduction(JamInkKind::Bw)
+        .unwrap()
+        .is_none());
 
     // 1-page B&W simplex = 200 paise
     engine
@@ -128,13 +131,20 @@ fn jam_deduction_increments_count_and_clamps_total_at_zero() {
         ))
         .unwrap();
 
-    let after_one = engine.apply_jam_deduction().unwrap().unwrap();
+    // Cannot deduct Color jam when session has 0 Color sides
+    let color_err = engine.apply_jam_deduction(JamInkKind::Color).unwrap_err();
+    assert!(matches!(color_err, LedgerError::InvalidInput(_)));
+
+    let after_one = engine.apply_jam_deduction(JamInkKind::Bw).unwrap().unwrap();
     assert_eq!(after_one.jam_deducted_pages, 1);
+    assert_eq!(after_one.bw_jam_deducted_pages, 1);
+    assert_eq!(after_one.color_jam_deducted_pages, 0);
     assert_eq!(after_one.total_amount_paise, 0);
 
     // Second jam keeps total clamped at 0 (never negative) while recording jam count
-    let after_two = engine.apply_jam_deduction().unwrap().unwrap();
+    let after_two = engine.apply_jam_deduction(JamInkKind::Bw).unwrap().unwrap();
     assert_eq!(after_two.jam_deducted_pages, 2);
+    assert_eq!(after_two.bw_jam_deducted_pages, 2);
     assert_eq!(after_two.total_amount_paise, 0);
 }
 
@@ -219,7 +229,7 @@ fn daily_audit_report_separates_payment_modes_and_flags_void_leakage() {
             "2026-11-27T12:10:00Z",
         ))
         .unwrap();
-    engine.apply_jam_deduction().unwrap();
+    engine.apply_jam_deduction(JamInkKind::Bw).unwrap();
     engine
         .close_active_session(SessionStatus::PaidCash, "2026-11-27T12:11:00Z")
         .unwrap();
@@ -527,4 +537,183 @@ fn idempotent_dedup_atomic_bookmark_and_unknown_duplex_fallback() {
         .ingest_print_job_with_bookmark(job2, channel, "   ")
         .is_err());
     assert!(engine.get_active_summary().unwrap().is_none());
+}
+
+
+#[test]
+fn mixed_session_bw_and_color_jam_deductions_and_append_only_jobs() {
+    let db = LedgerDb::open_in_memory().unwrap();
+    let mut engine = SessionEngine::new(db);
+
+    // 1. Mixed session: 13p B&W Duplex (6*300 + 200 = 2000p) + 12p Color Duplex (6*1800 = 10800p)
+    let job_bw = make_job(
+        801,
+        "notes_bw.pdf",
+        13,
+        1,
+        true,
+        false,
+        "2026-11-28T10:00:00Z",
+    );
+    let job_color = make_job(
+        802,
+        "diagrams_color.pdf",
+        12,
+        1,
+        true,
+        true,
+        "2026-11-28T10:00:20Z",
+    );
+    engine.ingest_print_job(job_bw).unwrap();
+    let before_jam = engine.ingest_print_job(job_color).unwrap();
+    assert_eq!(before_jam.total_amount_paise, 12_800);
+    assert_eq!(before_jam.bw_jam_rate_paise, 200);
+    assert_eq!(before_jam.color_jam_rate_paise, 1000);
+    assert_eq!(before_jam.unverified_jobs_count, 0);
+    assert_eq!(before_jam.jobs.len(), 2);
+    // Ordered newest-first so active HUD puts most recent print at the top
+    assert_eq!(before_jam.jobs[0].doc_name, "diagrams_color.pdf");
+    assert_eq!(before_jam.jobs[0].cost_paise, 10_800);
+    assert_eq!(before_jam.jobs[0].duplex_mode, DuplexMode::DuplexLongEdge);
+    assert_eq!(before_jam.jobs[0].color_mode, ColorMode::Color);
+    assert_eq!(before_jam.jobs[1].doc_name, "notes_bw.pdf");
+    assert_eq!(before_jam.jobs[1].cost_paise, 2000);
+
+    // Deduct 1 Color jam -> exact 1000p deducted (12800 -> 11800)
+    let after_color_jam = engine.apply_jam_deduction(JamInkKind::Color).unwrap().unwrap();
+    assert_eq!(after_color_jam.total_amount_paise, 11_800);
+    assert_eq!(after_color_jam.bw_jam_deducted_pages, 0);
+    assert_eq!(after_color_jam.color_jam_deducted_pages, 1);
+    assert_eq!(after_color_jam.jam_deducted_pages, 1);
+
+    // Deduct 1 B&W jam -> exact 200p deducted (11800 -> 11600)
+    let after_bw_jam = engine.apply_jam_deduction(JamInkKind::Bw).unwrap().unwrap();
+    assert_eq!(after_bw_jam.total_amount_paise, 11_600);
+    assert_eq!(after_bw_jam.bw_jam_deducted_pages, 1);
+    assert_eq!(after_bw_jam.color_jam_deducted_pages, 1);
+    assert_eq!(after_bw_jam.jam_deducted_pages, 2);
+
+    // Verify `print_jobs` stayed strictly append-only (job counts, pages, and costs unchanged)
+    assert_eq!(after_bw_jam.jobs.len(), 2);
+    assert_eq!(after_bw_jam.jobs[0].cost_paise, 10_800);
+    assert_eq!(after_bw_jam.jobs[1].cost_paise, 2000);
+
+    // 2. Color-only session rejects B&W jam deduction and clamps Color jam total at 0
+    engine
+        .close_active_session(SessionStatus::PaidUpi, "2026-11-28T10:05:00Z")
+        .unwrap();
+    engine
+        .ingest_print_job(make_job(
+            803,
+            "photo_only.pdf",
+            1,
+            1,
+            false,
+            true,
+            "2026-11-28T10:10:00Z",
+        ))
+        .unwrap();
+
+    let bw_err = engine.apply_jam_deduction(JamInkKind::Bw).unwrap_err();
+    assert!(matches!(bw_err, LedgerError::InvalidInput(_)));
+
+    // 1000p - 1000p = 0p, then second color jam clamps safely at 0p
+    let c1 = engine.apply_jam_deduction(JamInkKind::Color).unwrap().unwrap();
+    assert_eq!(c1.total_amount_paise, 0);
+    assert_eq!(c1.color_jam_deducted_pages, 1);
+    let c2 = engine.apply_jam_deduction(JamInkKind::Color).unwrap().unwrap();
+    assert_eq!(c2.total_amount_paise, 0);
+    assert_eq!(c2.color_jam_deducted_pages, 2);
+}
+
+#[test]
+fn session_summary_surfaces_unverified_unknown_modes_and_legacy_db_migration() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("printust_legacy_mig_{unique}"));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("legacy.db");
+
+    // Simulate a pre-patch SQLite database lacking `bw_jam_deducted_pages`,
+    // `color_jam_deducted_pages`, and `print_jobs.cost_paise`.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                closed_at TEXT,
+                status TEXT NOT NULL CHECK(status IN ('ACTIVE','PAID_UPI','PAID_CASH','KHATA','VOID')),
+                total_amount_paise INTEGER NOT NULL DEFAULT 0,
+                jam_deducted_pages INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE print_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER REFERENCES sessions(id),
+                windows_job_id INTEGER NOT NULL,
+                printer_name TEXT NOT NULL,
+                doc_name TEXT NOT NULL,
+                raw_pages INTEGER NOT NULL,
+                raw_copies INTEGER NOT NULL DEFAULT 1,
+                effective_pages INTEGER NOT NULL,
+                is_duplex INTEGER NOT NULL DEFAULT 0,
+                is_color INTEGER NOT NULL DEFAULT 0,
+                driver_anomaly_flag TEXT,
+                captured_at TEXT NOT NULL
+             );
+             INSERT INTO sessions (id, started_at, status, total_amount_paise, jam_deducted_pages)
+             VALUES (1, '2026-11-28T09:00:00Z', 'ACTIVE', 2000, 0);
+             INSERT INTO print_jobs (
+                session_id, windows_job_id, printer_name, doc_name,
+                raw_pages, raw_copies, effective_pages, is_duplex, is_color,
+                driver_anomaly_flag, captured_at
+             ) VALUES (
+                1, 91, 'ShopTest_PCL6', 'legacy_scan.pdf',
+                13, 1, 13, 1, 0, NULL, '2026-11-28T09:00:01Z'
+             );",
+        )
+        .unwrap();
+    }
+
+    {
+        let db = LedgerDb::open_file(&db_path).unwrap();
+        let mut engine = SessionEngine::new(db);
+
+        // Legacy row gets fallback cost recomputed cleanly (6*300 + 200 = 2000p) and
+        // Unknown duplex/color flags surface in unverified_jobs_count.
+        let legacy_summary = engine.get_active_summary().unwrap().unwrap();
+        assert_eq!(legacy_summary.jobs.len(), 1);
+        assert_eq!(legacy_summary.jobs[0].cost_paise, 2000);
+        assert_eq!(legacy_summary.unverified_jobs_count, 1);
+        assert!(legacy_summary.has_anomaly);
+        assert!(legacy_summary
+            .anomaly_reasons
+            .contains(&"DUPLEX_UNKNOWN".to_owned()));
+        assert!(legacy_summary
+            .anomaly_reasons
+            .contains(&"COLOR_UNKNOWN".to_owned()));
+
+        // Verified job does not inflate unverified_jobs_count
+        engine
+            .ingest_print_job(make_job(
+                92,
+                "verified_color.pdf",
+                2,
+                1,
+                false,
+                true,
+                "2026-11-28T09:01:00Z",
+            ))
+            .unwrap();
+        let after_second = engine.get_active_summary().unwrap().unwrap();
+        assert_eq!(after_second.job_count, 2);
+        assert_eq!(after_second.unverified_jobs_count, 1);
+        assert_eq!(after_second.jobs[0].cost_paise, 2000);
+        assert!(!after_second.jobs[0].is_unverified);
+        assert!(after_second.jobs[1].is_unverified);
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -287,15 +287,29 @@ impl IncomingPrintJob {
 
     /// Resolve `(pages_per_copy, copies)` safely without double-multiplying unrolled Event 307 counts.
     pub fn resolved_pricing_inputs(&self) -> (u32, u32) {
-        let copies = self.raw_copies.max(1);
-        if self.raw_pages > 0 && self.raw_pages.saturating_mul(copies) == self.effective_pages {
-            (self.raw_pages, copies)
-        } else if self.resolved_is_duplex() && copies > 1 && self.effective_pages.is_multiple_of(copies)
-        {
-            (self.effective_pages / copies, copies)
-        } else {
-            (self.effective_pages, 1)
-        }
+        resolve_pricing_inputs(
+            self.raw_pages,
+            self.raw_copies,
+            self.effective_pages,
+            self.resolved_is_duplex(),
+        )
+    }
+}
+
+/// Shared unrolled-copy heuristic resolving `(pages_per_copy, copies)` from stored or live fields.
+pub fn resolve_pricing_inputs(
+    raw_pages: u32,
+    raw_copies: u32,
+    effective_pages: u32,
+    is_duplex: bool,
+) -> (u32, u32) {
+    let copies = raw_copies.max(1);
+    if raw_pages > 0 && raw_pages.saturating_mul(copies) == effective_pages {
+        (raw_pages, copies)
+    } else if is_duplex && copies > 1 && effective_pages.is_multiple_of(copies) {
+        (effective_pages / copies, copies)
+    } else {
+        (effective_pages, 1)
     }
 }
 
@@ -304,9 +318,29 @@ impl IncomingPrintJob {
 #[serde(tag = "outcome", content = "summary", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum IngestOutcome {
     /// Event was newly inserted, billed, and persisted (with optional bookmark advance).
-    Applied(SessionSummary),
+    Applied(Box<SessionSummary>),
     /// Event `(printer_name, event_record_id)` was already processed and skipped cleanly.
     DuplicateIgnored,
+}
+
+/// Ink category for per-page paper jam deductions in mixed B&W + Color sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JamInkKind {
+    /// Deduct 1 black-and-white jammed side (`PricingRules::bw_single_paise`).
+    Bw,
+    /// Deduct 1 color jammed side (`PricingRules::color_single_paise`).
+    Color,
+}
+
+impl JamInkKind {
+    /// Human-readable uppercase tag used in error messages and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bw => "B&W",
+            Self::Color => "COLOR",
+        }
+    }
 }
 
 /// Non-print shop add-on attached to a billing session (e.g., Spiral Binding, Lamination).
@@ -317,6 +351,21 @@ pub struct SessionAddon {
     pub label: String,
     pub qty: i64,
     pub unit_price_paise: i64,
+}
+
+/// Compact per-job breakdown entry included in `SessionSummary` for instant Mini-HUD clarity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionJobBreakdown {
+    pub job_id: i64,
+    pub doc_name: String,
+    pub effective_pages: i64,
+    pub duplex_mode: DuplexMode,
+    pub color_mode: ColorMode,
+    pub is_duplex: bool,
+    pub is_color: bool,
+    pub cost_paise: i64,
+    pub anomaly: Option<String>,
+    pub is_unverified: bool,
 }
 
 /// Live UI summary snapshot emitted to the floating Mini-HUD over Tauri IPC.
@@ -330,9 +379,23 @@ pub struct SessionSummary {
     pub bw_pages: i64,
     pub color_pages: i64,
     pub jam_deducted_pages: i64,
+    #[serde(default)]
+    pub bw_jam_deducted_pages: i64,
+    #[serde(default)]
+    pub color_jam_deducted_pages: i64,
+    #[serde(default)]
+    pub bw_jam_rate_paise: i64,
+    #[serde(default)]
+    pub color_jam_rate_paise: i64,
     pub addons_total_paise: i64,
     pub total_amount_paise: i64,
     pub has_anomaly: bool,
+    #[serde(default)]
+    pub unverified_jobs_count: i64,
+    #[serde(default)]
+    pub anomaly_reasons: Vec<String>,
+    #[serde(default)]
+    pub jobs: Vec<SessionJobBreakdown>,
     pub last_doc_name: Option<String>,
 }
 

@@ -19,6 +19,7 @@ spike/raw_xml_samples/*.xml
 target/
 **/target/
 src-tauri/target/
+src-tauri/gen/
 node_modules/
 dist/
 .agents/
